@@ -15,10 +15,9 @@
 
 
 #define DAC_PIN 25
-#define BUTTON 3
-#define LED LED_BUILTIN
+#define ERROR_LED LED_BUILTIN
+#define LEDSTRIP_PIN 32
 
-bool not_pressed = true;
 
 WiFiUDP udp_client;
 WiFiUDP udp_server;
@@ -30,23 +29,31 @@ byte rates[RATE_SIZE]; //Array of heart rates
 byte rateSpot = 0;
 long lastBeat = 0; //Time at which the last beat occurred
 float beatsPerMinute;
-int beatAvg;
+int beatAvg = 60;
 boolean suspend = true;
+int received_BPM = 60;
 
 TaskHandle_t playerHandle;
 
+/*--------------------Audio Functions--------------------*/
+
 void beatPlayer(void *arg) {
     while(1) {
-    Serial.println("Start Player");
+    //Serial.println("Start Player");
     for (int i = 0; i < SOUND_SAMPLES; i++){
-      dacWrite(DAC_PIN, t[i]); // Square
-      delayMicroseconds((60E6)/(SR*beatAvg));
+      dacWrite(DAC_PIN, t[i]);
+      ledcWrite(0, t[i]);
+      delayMicroseconds((60E6)/(SR*received_BPM));
       if(suspend) break;
     }
     dacWrite(DAC_PIN, 0);
-    vTaskDelay(((1000*beatAvg)/60.0));
+    ledcWrite(0, 0);
+    //Serial.println(received_BPM);
+    vTaskDelay(((1000*received_BPM)/60.0/2));
   }
 }
+
+/*--------------------Comunication Functions--------------------*/
 
 void udpSend(String text) {
   udp_client.beginPacket(DEST, PORT);//Inicializa o pacote de transmissao ao IP e PORTA.
@@ -58,24 +65,21 @@ void udpListen() {
    if (udp_server.parsePacket() > 0) {
        String req = "";
        while (udp_server.available() > 0) req += (char) udp_server.read();
-       Serial.println(req);
+       //Serial.println(req);
+       if(req.toInt() < 0) {
+         //Serial.println("STOP");
+         received_BPM = 60;
+         suspend = true;
+         ledcWrite(0, 0);
+         vTaskSuspend(playerHandle);
+       }
+       else if(req.toInt() > 0){
+         received_BPM = req.toInt();
+         //Serial.println(received_BPM);
+         suspend = false;
+         xTaskResumeFromISR(playerHandle);
+       }
    }
-}
-
-void readButton() {
-    if(!digitalRead(BUTTON) && not_pressed) {
-      Serial.println("Send");
-      udpSend("oi");
-      not_pressed = false;
-    }
-    else if(digitalRead(BUTTON)) not_pressed = true;
-}
-
-void sender(void *arg) {
-    while(1) {
-        readButton();
-        vTaskDelay(1);
-    }
 }
 
 void server(void *arg) {
@@ -85,15 +89,35 @@ void server(void *arg) {
     }
 }
 
+void reconnect (){
+  while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+}
+
 void WiFiStart() {
-  WiFiManager wifiManager;
-  wifiManager.autoConnect(NAME);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SSID, PASS);
   Serial.println("Ready");
+  reconnect();
   Serial.print("IP address Host: ");
   Serial.println(WiFi.localIP());
   Serial.print("IP address Dest: ");
   Serial.println(DEST);
 }
+
+/*--------------------Light Effect Functions--------------------*/
+
+void ledStart(int ledpin) {
+  int CH = 0;
+  int F = 4000;
+  int resolution = 8;
+  ledcAttachPin(ledpin, CH);
+  ledcSetup(CH, F, resolution);
+}
+
+/*--------------------BPM Sensor Functions--------------------*/
 
 void restartBPMCount() {
   beatsPerMinute = 60;
@@ -106,18 +130,19 @@ void sensorStart () {
     Serial.println("MAX30105 was not found. Please check wiring/power. ");
     while (1);
   }
-  restartBPMCount();
+
   particleSensor.setup();
   particleSensor.setPulseAmplitudeRed(0x0A);
   particleSensor.setPulseAmplitudeGreen(0);
+  restartBPMCount();
+  received_BPM = 60;
+  suspend = true;
 }
 
 void readSensor() {
   long irValue = particleSensor.getIR();
-  if (irValue >= 50000){
+  if (irValue >= 50000) {
     if (checkForBeat(irValue) == true) {
-      suspend = false;
-      xTaskResumeFromISR(playerHandle);
       long delta = millis() - lastBeat;
       lastBeat = millis();
       beatsPerMinute = 60 / (delta / 1000.0);
@@ -130,19 +155,13 @@ void readSensor() {
         beatAvg /= RATE_SIZE;
       }
     }
-    Serial.print ("rate=");
-    Serial.print((1E6*60)/(SR*beatAvg));
-    Serial.print(", IR=");
-    Serial.print(irValue);
-    Serial.print(", BPM=");
-    Serial.print(beatsPerMinute);
-    Serial.print(", Avg BPM=");
-    Serial.println(beatAvg);
+    //Serial.println(beatAvg);
+    udpSend(String(beatAvg));
   }
   else {
+    udpSend("-1");
+    vTaskDelay(500);
     restartBPMCount();
-    suspend = true;
-    vTaskSuspend(playerHandle);
   }
 }
 
@@ -153,15 +172,8 @@ void getSensor(void *arg) {
     }
 }
 
-
+/*--------------------MTasks Manager--------------------*/
 void taskCreator() {
-  xTaskCreate(sender,
-                      "sender",
-                      2048,
-                      NULL,
-                      4,
-                      NULL);
-
   xTaskCreate(server,
                       "server",
                       2048,
@@ -175,6 +187,7 @@ void taskCreator() {
                       NULL,
                       1,
                       NULL);
+
   xTaskCreate(beatPlayer,
                       "player",
                       2048,
@@ -185,17 +198,19 @@ void taskCreator() {
 
 void setup(){
     Serial.begin(115200);
+    delay(1000);
     Serial.println("Booting");
-    pinMode(LED, OUTPUT);
-    pinMode(BUTTON, INPUT_PULLUP);
     WiFiStart();
     ArduinoOTA.setHostname(NAME);
     ArduinoOTA.begin();
     udp_server.begin(PORT);
     sensorStart();
+    ledStart(LEDSTRIP_PIN);
     taskCreator();
+    vTaskSuspend(playerHandle);
 }
 
 void loop(){
     ArduinoOTA.handle();
+    reconnect();
 }
